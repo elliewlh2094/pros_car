@@ -1,3 +1,8 @@
+"""
+導航決策邏輯的核心，決定自走車下一步該採取哪種動作（如直行、左轉、原地旋轉等）
+為 car_controller 提供動作指令
+"""
+
 from pros_car_py.nav2_utils import (
     get_yaw_from_quaternion,
     get_direction_vector,
@@ -237,7 +242,7 @@ class Nav2Processing:
         """
         yolo_target_info = self.data_processor.get_yolo_target_info()
         camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
-        yolo_target_info[1] *= 100.0
+        yolo_target_object_depth = yolo_target_info[1] * 100.0
         camera_multi_depth = list(
             map(lambda x: x * 100.0, self.data_processor.get_camera_x_multi_depth())
         )
@@ -249,25 +254,30 @@ class Nav2Processing:
         camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
         camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
         action = "STOP"
+        slowdown_distance = 15.0
         limit_distance = 10.0
-        print(yolo_target_info[1])
         if all(depth > limit_distance for depth in camera_forward_depth):
+            print(f"camera_forward_depth: {camera_forward_depth}")
             if yolo_target_info[0] == 1:
                 if yolo_target_info[2] > 200.0:
                     action = "CLOCKWISE_ROTATION_SLOW"
                 elif yolo_target_info[2] < -200.0:
                     action = "COUNTERCLOCKWISE_ROTATION_SLOW"
                 else:
-                    if yolo_target_info[1] < 2.0:
+                    print(f"yolo_target_object_depth: {yolo_target_object_depth}")
+                    if yolo_target_object_depth < limit_distance:
                         action = "STOP"
                     else:
                         action = "FORWARD_SLOW"
             else:
                 action = "FORWARD"
-        elif any(depth < limit_distance for depth in camera_left_depth):
-            action = "CLOCKWISE_ROTATION"
         elif any(depth < limit_distance for depth in camera_right_depth):
+            print(f"camera_right_depth: {camera_right_depth}")
             action = "COUNTERCLOCKWISE_ROTATION"
+        elif any(depth < limit_distance for depth in camera_left_depth):
+            print(f"camera_left_depth: {camera_left_depth}")
+            action = "CLOCKWISE_ROTATION"
+
         return action
 
     def stop_nav(self):

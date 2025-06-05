@@ -1,4 +1,9 @@
-# from geometry_msgs.msg impor
+"""
+接收來自 ROS 訂閱的感測器資料: amcl pose, yolo, camera, lidar, mediapipe, plan
+負責資料抽象化，將原始感測資料轉換為易於運用的格式或進行特徵萃取
+"""
+
+
 import math
 import time
 
