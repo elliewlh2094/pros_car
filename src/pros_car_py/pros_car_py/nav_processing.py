@@ -11,7 +11,10 @@ from pros_car_py.nav2_utils import (
     cal_distance,
 )
 import math
+import time
+import numpy as np
 
+ROTATE_MAX = 30
 
 class Nav2Processing:
     def __init__(self, ros_communicator, data_processor):
@@ -23,6 +26,13 @@ class Nav2Processing:
         self.index_length = 0
         self.recordFlag = 0
         self.goal_published_flag = False
+
+        # FSM
+        self.state = "fsm_start"
+        self.last_detected_offset = 0.0
+        self.last_rotate_direction = None
+        self.rotation_counter = 0
+        
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -161,6 +171,7 @@ class Nav2Processing:
     def filter_negative_one(self, depth_list):
         return [depth for depth in depth_list if depth != -1.0]
 
+
     def camera_nav(self):
         """
         YOLO 目標資訊 (yolo_target_info) 說明：
@@ -242,41 +253,95 @@ class Nav2Processing:
         """
         yolo_target_info = self.data_processor.get_yolo_target_info()
         camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
+        if camera_multi_depth == None and yolo_target_info == None:
+            return "STOP"
+        
+        detected = (yolo_target_info[0] == 1)
         yolo_target_object_depth = yolo_target_info[1] * 100.0
+        yolo_target_offset = yolo_target_info[2] * 100.0
         camera_multi_depth = list(
             map(lambda x: x * 100.0, self.data_processor.get_camera_x_multi_depth())
         )
-
-        if camera_multi_depth == None or yolo_target_info == None:
-            return "STOP"
-
-        camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
+        camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:14])
         camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
-        camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
+        camera_right_depth = self.filter_negative_one(camera_multi_depth[14:20])
+        left_depth_min = np.min(camera_left_depth)
+        right_depth_min = np.min(camera_right_depth)
+        prefer_left = left_depth_min > right_depth_min
         action = "STOP"
-        slowdown_distance = 15.0
+
         limit_distance = 10.0
-        if all(depth > limit_distance for depth in camera_forward_depth):
-            print(f"camera_forward_depth: {camera_forward_depth}")
-            if yolo_target_info[0] == 1:
-                if yolo_target_info[2] > 200.0:
-                    action = "CLOCKWISE_ROTATION_SLOW"
-                elif yolo_target_info[2] < -200.0:
-                    action = "COUNTERCLOCKWISE_ROTATION_SLOW"
-                else:
-                    print(f"yolo_target_object_depth: {yolo_target_object_depth}")
-                    if yolo_target_object_depth < limit_distance:
-                        action = "STOP"
-                    else:
-                        action = "FORWARD_SLOW"
+        target_distance = 5.0
+
+        
+        # =============================================================
+        # FSM state: fsm_start, align_target, explore, backward
+        # 狀態切換順序要按重要性排
+        # =============================================================
+
+        print(f"============== self.state {self.state} =============")
+        if self.state == "fsm_start":
+            if detected:
+                self.state = "align_target"
+            elif all(depth < limit_distance for depth in camera_forward_depth):
+                self.state = "backward"
             else:
-                action = "FORWARD"
-        elif any(depth < limit_distance for depth in camera_right_depth):
-            print(f"camera_right_depth: {camera_right_depth}")
-            action = "COUNTERCLOCKWISE_ROTATION"
-        elif any(depth < limit_distance for depth in camera_left_depth):
+                self.state = "explore"
+
+        elif self.state == "align_target":
+            print(f"yolo_target_offset: {yolo_target_offset}")
+            self.last_detected_offset = yolo_target_offset
+            if yolo_target_offset < 10:
+                action = "CLOCKWISE_ROTATION"
+            elif yolo_target_offset > -10:
+                action = "COUNTERCLOCKWISE_ROTATION"
+
+            print(f"yolo_target_object_depth: {yolo_target_object_depth}")
+            if yolo_target_object_depth < target_distance:
+                action = "STOP"
+            elif all(depth < limit_distance for depth in camera_forward_depth):
+                action = "FORWARD_SLOW"
+            else:
+                self.state = "explore"
+
+
+        elif self.state == "backward":
+            print(f"camera_forward_depth: {camera_forward_depth}")
+            action = "BACKWARD"
+            if all(depth > limit_distance for depth in camera_forward_depth):
+                self.state = "explore"
+
+
+        # 積極前進和向空曠處轉彎
+        elif self.state == "explore":
+            print(f"camera_forward_depth: {camera_forward_depth}")
             print(f"camera_left_depth: {camera_left_depth}")
-            action = "CLOCKWISE_ROTATION"
+            print(f"camera_right_depth: {camera_right_depth}")
+            action = "FORWARD"
+
+            if any(depth > limit_distance for depth in camera_forward_depth):
+                action = "FORWARD"
+            elif self.rotation_counter < ROTATE_MAX and self.last_rotate_direction is not None:
+                print(f"self.rotation_counter: {self.rotation_counter}")
+                self.rotation_counter += 1
+                action = "CLOCKWISE_ROTATION" if self.last_rotate_direction == "clockwise" else "COUNTERCLOCKWISE_ROTATION"
+            else:
+                self.rotation_counter = 0
+                # 先朝上一次 offset 方向旋轉
+                if self.last_detected_offset != 0:
+                    print(f"last_detected_offset:{self.last_detected_offset}")
+                    self.last_rotate_direction = "clockwise" if self.last_detected_offset < 0 else "counterclockwise"
+                    action = "CLOCKWISE_ROTATION" if self.last_detected_offset < 0 else "COUNTERCLOCKWISE_ROTATION"
+                # 不然就朝有空間的地方轉
+                else:
+                    if prefer_left:
+                        action = "COUNTERCLOCKWISE_ROTATION"
+                        self.last_rotate_direction = "counterclockwise"
+                    else:
+                        action = "CLOCKWISE_ROTATION"
+                        self.last_rotate_direction = "clockwise"
+            if detected:
+                self.state = "align_target"
 
         return action
 
