@@ -13,8 +13,31 @@ from pros_car_py.nav2_utils import (
 import math
 import time
 import numpy as np
+from enum import Enum, auto
+import random
 
 ROTATE_MAX = 30
+
+SAFE_DIST = 100.0 # 大於 100.0 代表可前進
+OBSTACLE_DIST = 50.0 # 小於 50.0 代表有障礙
+ROTATION_MIN_DURATION = 0.5
+ROTATION_MAX_DURATION = 1.0
+ROTATION_FIXED_DURATION = 0.7
+FORWARD_DURATION = 1.0
+BACKWARD_DURATION = 0.5
+STOP_DURATION = 0.5
+STOP_MAX = 3
+D_YOLO_OFFSET = 1.0
+
+class FSMState(Enum):
+    IDLE = auto()
+    ROTATE = auto()
+    CHECK_SAFE = auto()
+    FORWARD = auto()
+    STOP = auto()
+    BACKWARD = auto()
+    ALIGN_TARGET = auto()
+    APPROACH_TARGET = auto()
 
 class Nav2Processing:
     def __init__(self, ros_communicator, data_processor):
@@ -28,10 +51,14 @@ class Nav2Processing:
         self.goal_published_flag = False
 
         # FSM
-        self.state = "fsm_start"
+        self.state = FSMState.IDLE
         self.last_detected_offset = 0.0
-        self.last_rotate_direction = None
-        self.rotation_counter = 0
+        self.rotate_direction = 1 # 1: counterclockwise, -1: clockwise
+        self.last_rotate_direction = 1
+
+        self.state_duration = 0.0
+        self.fsm_start_time = time.time()
+        self.stop_counter = 0
         
 
     def reset_nav_process(self):
@@ -227,10 +254,9 @@ class Nav2Processing:
             action = "COUNTERCLOCKWISE_ROTATION"
         return action
 
+
     def camera_nav_unity(self):
         """
-        YOLO 目標資訊 (yolo_target_info) 說明：
-
         - 索引 0 (index 0)：
             - 表示是否成功偵測到目標
             - 0：未偵測到目標
@@ -245,105 +271,191 @@ class Nav2Processing:
             - 若目標位於畫面中心右側，數值為正
             - 若目標位於畫面中心左側，數值為負
             - 若沒有目標則回傳 0
+        """
+        yolo_target_info = self.data_processor.get_yolo_target_info()
 
-        畫面 n 個等分點深度 (camera_multi_depth) 說明 :
-
+        """
         - 儲存相機畫面中央高度上 n 個等距水平點的深度值。
         - 若距離過遠、過近（小於 40 公分）或是實體相機有時候深度會出一些問題，則該點的深度值將設定為 -1。
         """
-        yolo_target_info = self.data_processor.get_yolo_target_info()
         camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
-        if camera_multi_depth == None and yolo_target_info == None:
-            return "STOP"
-        
-        detected = (yolo_target_info[0] == 1)
-        yolo_target_object_depth = yolo_target_info[1] * 100.0
-        yolo_target_offset = yolo_target_info[2] * 100.0
         camera_multi_depth = list(
             map(lambda x: x * 100.0, self.data_processor.get_camera_x_multi_depth())
         )
-        camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:14])
-        camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
-        camera_right_depth = self.filter_negative_one(camera_multi_depth[14:20])
-        left_depth_min = np.min(camera_left_depth)
-        right_depth_min = np.min(camera_right_depth)
-        prefer_left = left_depth_min > right_depth_min
-        action = "STOP"
+        
+        """
+        - 自走車正面 lidar 偵測 91 個數值
+        - combined_lidar_data[0:31] 是前方的距離
+        - combined_lidar_data[31:61] 是左側的距離
+        - combined_lidar_data[61:31] 是右側的距離
+        - 單位是公尺
+        )
+        """
+        combined_lidar_data = list(
+            map(lambda x: x * 100.0, self.data_processor.get_processed_lidar())
+        )
+        combined_lidar_data = [lrange for lrange in combined_lidar_data if lrange > 10]
+        if camera_multi_depth == None and yolo_target_info == None and combined_lidar_data == None:
+            return "STOP"
+
+        detected = (yolo_target_info[0] == 1)
+        yolo_target_object_depth = yolo_target_info[1] * 100.0
+        yolo_target_offset = yolo_target_info[2] * 100.0
+
+        # camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:14])
+        # camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
+        # camera_right_depth = self.filter_negative_one(camera_multi_depth[14:20])
+        # left_depth_min = np.min(camera_left_depth)
+        # right_depth_min = np.min(camera_right_depth)
+
+        lidar_forward = self.filter_negative_one(combined_lidar_data[0:30])
+        lidar_left = self.filter_negative_one(combined_lidar_data[30:60])
+        lidar_right = self.filter_negative_one(combined_lidar_data[60:90])
+        left_narrow = any(lrange < OBSTACLE_DIST for lrange in lidar_left)
+        right_narrow = any(lrange < OBSTACLE_DIST for lrange in lidar_right)
+
+        # prefer_left = left_depth_min > right_depth_min
+        # action = "STOP"
 
         limit_distance = 10.0
         target_distance = 5.0
 
         
         # =============================================================
-        # FSM state: fsm_start, align_target, explore, backward
+        # FSM state: IDLE, ROTATE, CHECK_SAFE, FORWARD, STOP, BACKWARD, ALIGN_TARGET, APPROACH_TARGET
         # 狀態切換順序要按重要性排
+        # IDLE -> ROTATE -> CHECK_SAFE
+        # CHECK_SAVE(save) -> FORWARD -> ROTATE -> CHECK_SAFE -> ...
+        # CHECK_SAVE(unsave) -> ROTATE -> CHECK_SAFE -> ...
+        # FORWARD -> (if close to obstacle) STOP -> ROTATE -> ...
+        # FORWARD ->  STOP -> (if stop for many time) BACKWARD -> ROTATE -> ...
+        # ROTATE -> (detected) ALIGN_TARGET -> (aligned) APPROACH_TARGET -> (if close to obstacle) STOP -> ROTATE -> ...
         # =============================================================
 
         print(f"============== self.state {self.state} =============")
-        if self.state == "fsm_start":
-            if detected:
-                self.state = "align_target"
-            elif all(depth < limit_distance for depth in camera_forward_depth):
-                self.state = "backward"
-            else:
-                self.state = "explore"
+        now = time.time()
+        dt = now - self.fsm_start_time
+        
+        match self.state:
+            case FSMState.IDLE:
+                self.state = FSMState.ROTATE
+                self.state_duration = random.uniform(ROTATION_MIN_DURATION, ROTATION_MAX_DURATION)
+                self.rotate_direction = random.choice([-1, 1])
+                self.fsm_start_time = now
+                print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                return "STOP"
 
-        elif self.state == "align_target":
-            print(f"yolo_target_offset: {yolo_target_offset}")
-            self.last_detected_offset = yolo_target_offset
-            if yolo_target_offset < 10:
-                action = "CLOCKWISE_ROTATION"
-            elif yolo_target_offset > -10:
-                action = "COUNTERCLOCKWISE_ROTATION"
+            # 根據給定狀態時間和旋轉角度動作
+            case FSMState.ROTATE:
+                if detected:
+                    self.state = FSMState.ALIGN_TARGET
+                    self.fsm_start_time = now
+                    return "STOP"
 
-            print(f"yolo_target_object_depth: {yolo_target_object_depth}")
-            if yolo_target_object_depth < target_distance:
-                action = "STOP"
-            elif all(depth < limit_distance for depth in camera_forward_depth):
-                action = "FORWARD_SLOW"
-            else:
-                self.state = "explore"
-
-
-        elif self.state == "backward":
-            print(f"camera_forward_depth: {camera_forward_depth}")
-            action = "BACKWARD"
-            if all(depth > limit_distance for depth in camera_forward_depth):
-                self.state = "explore"
-
-
-        # 積極前進和向空曠處轉彎
-        elif self.state == "explore":
-            print(f"camera_forward_depth: {camera_forward_depth}")
-            print(f"camera_left_depth: {camera_left_depth}")
-            print(f"camera_right_depth: {camera_right_depth}")
-            action = "FORWARD"
-
-            if any(depth > limit_distance for depth in camera_forward_depth):
-                action = "FORWARD"
-            elif self.rotation_counter < ROTATE_MAX and self.last_rotate_direction is not None:
-                print(f"self.rotation_counter: {self.rotation_counter}")
-                self.rotation_counter += 1
-                action = "CLOCKWISE_ROTATION" if self.last_rotate_direction == "clockwise" else "COUNTERCLOCKWISE_ROTATION"
-            else:
-                self.rotation_counter = 0
-                # 先朝上一次 offset 方向旋轉
-                if self.last_detected_offset != 0:
-                    print(f"last_detected_offset:{self.last_detected_offset}")
-                    self.last_rotate_direction = "clockwise" if self.last_detected_offset < 0 else "counterclockwise"
-                    action = "CLOCKWISE_ROTATION" if self.last_detected_offset < 0 else "COUNTERCLOCKWISE_ROTATION"
-                # 不然就朝有空間的地方轉
+                if dt < self.state_duration:
+                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
                 else:
-                    if prefer_left:
-                        action = "COUNTERCLOCKWISE_ROTATION"
-                        self.last_rotate_direction = "counterclockwise"
-                    else:
-                        action = "CLOCKWISE_ROTATION"
-                        self.last_rotate_direction = "clockwise"
-            if detected:
-                self.state = "align_target"
+                    self.state = FSMState.CHECK_SAFE
+                    self.fsm_start_time = now
+                    return "STOP"
 
-        return action
+           # 根據給定狀態時間動作
+            case FSMState.CHECK_SAFE:
+                if detected:
+                    self.state = FSMState.ALIGN_TARGET
+                    self.fsm_start_time = now
+                    return "STOP"
+   
+                if all(lrange > SAFE_DIST for lrange in lidar_forward):
+                    self.state = FSMState.FORWARD
+                    self.state_duration = FORWARD_DURATION
+                    return "FORWARD"
+                else:
+                    self.state = FSMState.ROTATE
+                    self.state_duration = ROTATION_FIXED_DURATION
+                    self.rotate_direction = random.choice([-1, 1])
+                    self.fsm_start_time = now
+                    print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    return "STOP"
+            
+            # 根據給定狀態時間動作    
+            case FSMState.FORWARD:
+                if any(lrange < OBSTACLE_DIST for lrange in lidar_forward):
+                    self.state = FSMState.STOP
+                    self.fsm_start_time = now
+                    print("DANGER!!!!!!!!!!!!!!!")
+                    return "STOP"
+                if dt < self.state_duration:
+                    return "FORWARD"
+                elif right_narrow == True or left_narrow == True:
+                    self.state = FSMState.ROTATE
+                    self.state_duration = random.uniform(ROTATION_MIN_DURATION, ROTATION_MAX_DURATION)
+                    self.rotate_direction = 1 if right_narrow else -1
+                    self.fsm_start_time = now
+                    return "STOP"
+                else:
+                    self.state = FSMState.ROTATE
+                    self.state_duration = random.uniform(ROTATION_MIN_DURATION, ROTATION_MAX_DURATION)
+                    self.rotate_direction = random.choice([-1, 1])
+                    self.fsm_start_time = now
+                    print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    return "STOP"
+
+            # 根據給定狀態時間動作
+            case FSMState.STOP:
+                print(f"stop_counter: {self.stop_counter}")
+                self.stop_counter += 1
+                if dt < self.state_duration:
+                    return "STOP"
+                elif self.stop_counter > STOP_MAX:
+                    self.stop_counter = 0
+                    self.state = FSMState.BACKWARD
+                    self.state_duration = BACKWARD_DURATION
+                    self.fsm_start_time = now
+                    return "BACKWARD"
+
+            # 根據給定狀態時間動作
+            case FSMState.BACKWARD:
+                if dt < self.state_duration:
+                    return "BACKWARD"
+                elif right_narrow == True or left_narrow == True:
+                    self.state = FSMState.ROTATE
+                    self.state_duration = ROTATION_FIXED_DURATION
+                    self.rotate_direction = 1 if right_narrow else -1
+                    self.fsm_start_time = now
+                    print(f"FIXED_DURATION: {self.state_duration}")
+                    return "STOP"
+                else:
+                    self.state = FSMState.ROTATE
+                    self.state_duration = ROTATION_FIXED_DURATION
+                    self.rotate_direction = random.choice([-1, 1])
+                    self.fsm_start_time = now
+                    print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    return "STOP"
+
+            # 根據給定狀態時間和旋轉角度動作
+            case FSMState.ALIGN_TARGET:
+                if abs(yolo_target_offset) > D_YOLO_OFFSET:
+                    self.last_detected_offset = 0.0
+                    self.rotate_direction = 1 if yolo_target_offset < 0 else -1
+                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
+                else:
+                    self.state = FSMState.CHECK_SAFE
+                    self.fsm_start_time = now
+                    return "STOP"
+
+            case FSMState.APPROACH_TARGET:
+                if (yolo_target_object_depth > 10.0 and 
+                    all(lrange > OBSTACLE_DIST for lrange in lidar_forward)):
+                    return "FORWARD"
+                elif yolo_target_object_depth < 10.0:
+                    self.last_detected_offset = yolo_target_offset
+                    self.state = FSMState.CHECK_SAFE
+                    self.fsm_start_time = now
+                    return "STOP"
+                    
+
+        return "STOP"
 
     def stop_nav(self):
         return "STOP"
