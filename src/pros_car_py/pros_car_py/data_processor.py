@@ -10,9 +10,9 @@ import time
 # LiDAR global constants
 LIDAR_RANGE = 90
 LIDAR_PER_SECTOR = 20
-FRONT_LIDAR_INDICES = list(range(0, 16)) + list(range(-15, 0))  # front lidar indices
-LEFT_LIDAR_INDICES = list(range(16, 46))  # left lidar indices
-RIGHT_LIDAR_INDICES = list(range(-45, -15))  # right lidar indices
+FRONT_LIDAR_INDICES = list(range(0, 11)) + list(range(-10, 0))  # front lidar indices
+LEFT_LIDAR_INDICES = list(range(11, 46))  # left lidar indices
+RIGHT_LIDAR_INDICES = list(range(-45, -10))  # right lidar indices
 
 
 class DataProcessor:
@@ -53,8 +53,8 @@ class DataProcessor:
                 ranges_180.append(all_ranges[i])
                 direction_180.append([math.cos(angle_tmp), math.sin(angle_tmp), 0])
         combined_lidar_data = (
-            [ranges_180[i] for i in FRONT_LIDAR_INDICES]
-            + [ranges_180[i] for i in LEFT_LIDAR_INDICES]
+            [ranges_180[i] for i in LEFT_LIDAR_INDICES]
+            + [ranges_180[i] for i in FRONT_LIDAR_INDICES]
             + [ranges_180[i] for i in RIGHT_LIDAR_INDICES]
         )
         return combined_lidar_data

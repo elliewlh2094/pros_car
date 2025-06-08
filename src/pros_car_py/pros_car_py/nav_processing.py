@@ -16,18 +16,20 @@ import numpy as np
 from enum import Enum, auto
 import random
 
-ROTATE_MAX = 30
 
-SAFE_DIST = 100.0 # 大於 100.0 代表可前進
-OBSTACLE_DIST = 50.0 # 小於 50.0 代表有障礙
+
+SAFE_DIST = 130.0 # 大於 130.0 代表可前進
+OBSTACLE_DIST = 80.0 # 小於 80.0 代表有障礙
 ROTATION_MIN_DURATION = 0.5
-ROTATION_MAX_DURATION = 1.0
-ROTATION_FIXED_DURATION = 0.7
-FORWARD_DURATION = 1.0
+ROTATION_MAX_DURATION = 1.5
+ROTATION_FIXED_DURATION = 1.0
+FORWARD_DURATION = 3.0
 BACKWARD_DURATION = 0.5
 STOP_DURATION = 0.5
-STOP_MAX = 3
-D_YOLO_OFFSET = 200.0 # 單位為像素
+ROTATE_MAX = 5
+D_YOLO_ALIGNED = 3.0# 單位為像素
+STUCK_LIDAR_THERES = 10
+STUCK_LIDAR_DURATION = 2.0
 
 class FSMState(Enum):
     IDLE = auto()
@@ -38,6 +40,7 @@ class FSMState(Enum):
     BACKWARD = auto()
     ALIGN_TARGET = auto()
     APPROACH_TARGET = auto()
+    FINISH = auto()
 
 class Nav2Processing:
     def __init__(self, ros_communicator, data_processor):
@@ -58,7 +61,12 @@ class Nav2Processing:
 
         self.state_duration = 0.0
         self.fsm_start_time = time.time()
+        self.rotation_counter = 0
         self.stop_counter = 0
+        self.backward_flag = 0
+        self.last_lidar_range = None
+        self.stuck_start_time = None
+        self.stuck_flag = 0
         
 
     def reset_nav_process(self):
@@ -254,6 +262,35 @@ class Nav2Processing:
             action = "COUNTERCLOCKWISE_ROTATION"
         return action
 
+    def check_vehicle_stuck_by_lidar(self, lidar_forward):
+        """
+        回傳 True 表示卡住需要脫困
+        條件: 前方最近距離的變化 < STUCK_LIDAR_THERES 持續 STUCK_LIDAR_DURATION
+        """
+        if not lidar_forward:
+            self.stuck_start_time = None
+            return False
+
+        front_min = min(lidar_forward)
+        now = time.time()
+
+        # 初始化
+        if self.last_lidar_range is None:
+            self.last_lidar_range = front_min
+            self.stuck_start_time = now
+            return False
+
+        if abs(front_min - self.last_lidar_range) < STUCK_LIDAR_THERES:
+            if (now - self.stuck_start_time) >= STUCK_LIDAR_DURATION:
+                self.stuck_start_time = None
+                self.last_lidar_range = None
+                return True
+            return False
+        else:
+            # 有明顯距離變化, 重新初始化
+            self.last_lidar_range = front_min
+            self.stuck_start_time = now
+            return False
 
     def camera_nav_unity(self):
         """
@@ -268,8 +305,8 @@ class Nav2Processing:
 
         - 索引 2 (index 2)：
             - 目標相對於畫面正中心的像素偏移量
-            - 若目標位於畫面中心右側，數值為正
-            - 若目標位於畫面中心左側，數值為負
+            - 若目標位於畫面中心左側，數值為正
+            - 若目標位於畫面中心右側，數值為負
             - 若沒有目標則回傳 0
         """
         yolo_target_info = self.data_processor.get_yolo_target_info()
@@ -285,9 +322,9 @@ class Nav2Processing:
         
         """
         - 自走車正面 lidar 偵測 91 個數值
-        - combined_lidar_data[0:31] 是前方的距離
-        - combined_lidar_data[31:61] 是左側的距離
-        - combined_lidar_data[61:31] 是右側的距離
+        - combined_lidar_data[0:35] 是左側的距離
+        - combined_lidar_data[35:56] 是前方的距離
+        - combined_lidar_data[56:91] 是右側的距離
         - 單位是公尺
         )
         """
@@ -298,7 +335,7 @@ class Nav2Processing:
         if camera_multi_depth == None and yolo_target_info == None and combined_lidar_data == None:
             return "STOP"
 
-        detected = (yolo_target_info[0] == 1)
+        detected_target = (yolo_target_info[0] == 1)
         yolo_target_object_depth = yolo_target_info[1] * 100.0
         yolo_target_offset = yolo_target_info[2] * 100.0
 
@@ -308,14 +345,22 @@ class Nav2Processing:
         # left_depth_min = np.min(camera_left_depth)
         # right_depth_min = np.min(camera_right_depth)
 
-        lidar_forward = self.filter_negative_one(combined_lidar_data[0:30])
-        lidar_left = self.filter_negative_one(combined_lidar_data[30:60])
-        lidar_right = self.filter_negative_one(combined_lidar_data[60:90])
+        lidar_left = self.filter_negative_one(combined_lidar_data[0:35])
+        lidar_forward = self.filter_negative_one(combined_lidar_data[35:55])
+        lidar_right = self.filter_negative_one(combined_lidar_data[55:90])
         left_narrow = any(lrange < OBSTACLE_DIST for lrange in lidar_left)
         right_narrow = any(lrange < OBSTACLE_DIST for lrange in lidar_right)
-
-        # prefer_left = left_depth_min > right_depth_min
+        left_max = np.max(lidar_left)
+        front_mean = np.mean(lidar_forward)
+        right_max = np.max(lidar_right)
+        left_wide = any(lrange > SAFE_DIST for lrange in lidar_left) 
+        right_wide = any(lrange > SAFE_DIST for lrange in lidar_right)
+        prefer_left = left_max > right_max
         # action = "STOP"
+
+        front_is_wide = all(lrange > SAFE_DIST for lrange in lidar_forward)
+        front_is_enough_space = any(lrange > SAFE_DIST for lrange in lidar_forward)
+        too_close = any(lrange < OBSTACLE_DIST for lrange in lidar_forward)
 
         limit_distance = 10.0
         target_distance = 5.0
@@ -343,93 +388,179 @@ class Nav2Processing:
                 self.rotate_direction = random.choice([-1, 1])
                 self.fsm_start_time = now
                 print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                print(f"Next status: {self.state}")
                 return "STOP"
 
-            # 根據給定狀態時間和旋轉角度動作
+            # 旋轉探索環境或避開障礙物
             case FSMState.ROTATE:
-                if detected:
+                if detected_target:
+                    self.rotation_counter = 0
+                    print(f"yolo_target_offset: {yolo_target_offset}")
                     self.last_detected_offset = yolo_target_offset
                     self.state = FSMState.ALIGN_TARGET
+                    print(f"Next status: {self.state}")
                     return "STOP"
 
                 if dt < self.state_duration:
-                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
-                else:
+                    # 有空間且前一個動作不是後退
+                    if front_is_enough_space and self.backward_flag == 0:
+                        self.rotation_counter = 0
+                        print(f"lrange: {lidar_forward}")
+                        self.state = FSMState.FORWARD
+                        self.state_duration = FORWARD_DURATION
+                        self.fsm_start_time = now
+                        print(f"Next status: {self.state}")
+                        return "FORWARD"
+                    else:
+                        print(f"Next status: {self.state}")
+                        return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
+
+                elif self.rotation_counter < ROTATE_MAX:
+                    print(f"rotation_counter: {self.rotation_counter}")
+                    self.rotation_counter += 1
                     self.state = FSMState.CHECK_SAFE
+                    print(f"Next status: {self.state}")
                     return "STOP"
-
-            # 根據給定狀態時間和旋轉角度動作
-            case FSMState.ALIGN_TARGET:
-                if not detected:
-                    print(f"self.last_detected_offset: {self.last_detected_offset}")
-                    self.state = FSMState.ROTATE
-                    self.state_duration = ROTATION_FIXED_DURATION
-                    self.rotate_direction = 1 if self.last_detected_offset < 0 else -1
-                    self.fsm_start_time = now
-                    print(f"rotate_direction: {self.rotate_direction}")
-                    return "STOP"
-                
-                if abs(yolo_target_offset) > D_YOLO_OFFSET:
-                    self.rotate_direction = 1 if yolo_target_offset < 0 else -1
-                    self.last_detected_offset = yolo_target_offset
-                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
-                
-                elif (yolo_target_object_depth > 10.0 and 
-                    all(lrange > SAFE_DIST for lrange in lidar_forward)):
-                    self.state = FSMState.APPROACH_TARGET
-                    return "STOP"
-
-            case FSMState.APPROACH_TARGET:
-                if any(lrange < OBSTACLE_DIST for lrange in lidar_forward):
-                    self.last_detected_offset = yolo_target_offset
+                else:
+                    self.rotation_counter = 0
                     self.state = FSMState.STOP
-                    self.state_duration = STOP_DURATION
-                    self.fsm_start_time = now
-                    print("DANGER!!!!!!!!!!!!!!!")
-                    return "STOP" 
-                               
-                if (yolo_target_object_depth > 10.0 and 
-                    all(lrange > SAFE_DIST for lrange in lidar_forward)):
-                    return "FORWARD"
-                elif yolo_target_object_depth < 10.0:
+                    print(f"Next status: {self.state}")
                     return "STOP"
 
-           # 根據給定狀態時間動作
-            case FSMState.CHECK_SAFE:
-                if detected:
+            # 移動車輛去對齊 target 
+            case FSMState.ALIGN_TARGET:
+                if abs(yolo_target_offset) > D_YOLO_ALIGNED:
+                    print(f"yolo_target_offset: {yolo_target_offset}")
+                    self.rotate_direction = 1 if yolo_target_offset > 0 else -1
+                    self.last_detected_offset = yolo_target_offset
+                    if self.check_vehicle_stuck_by_lidar(lidar_forward):
+                        self.state = FSMState.BACKWARD
+                        self.state_duration = BACKWARD_DURATION
+                        self.fsm_start_time = now
+                        print(f"Next status: {self.state}")
+                        return "BACKWARD"
+                    print(f"Next status: {self.state}")
+                    return "COUNTERCLOCKWISE_ROTATION_SLOW" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION_SLOW"
+
+                else:
+                    print(f"lrange: {lidar_forward}")
+                    self.state = FSMState.APPROACH_TARGET
+                    print(f"Next status: {self.state}")
+                    return "FORWARD"
+
+
+            # 對齊後向 target 前進
+            case FSMState.APPROACH_TARGET:
+                if not detected_target:
+                    if front_is_enough_space and front_mean > OBSTACLE_DIST:
+                        print(f"lrange: {lidar_forward}")
+                        if self.check_vehicle_stuck_by_lidar(lidar_forward):
+                            self.state = FSMState.BACKWARD
+                            self.state_duration = BACKWARD_DURATION
+                            self.fsm_start_time = now
+                            print(f"Next status: {self.state}")
+                            return "BACKWARD"
+                        print(f"Next status: {self.state}")
+                        return "FORWARD_SLOW"
+                    else:
+                        print(f"self.last_detected_offset: {self.last_detected_offset}")
+                        self.rotate_direction = 1 if self.last_detected_offset > 0 else -1
+                        print(f"Next status: {self.state}")
+                        return "COUNTERCLOCKWISE_ROTATION_SLOW" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION_SLOW"
+                if too_close and front_mean < OBSTACLE_DIST:
+                    print(f"lrange: {lidar_forward}")
+                    self.rotate_direction = 1 if prefer_left else -1
+                    print(f"rotate_direction: {self.rotate_direction}, STUCK!!!")
+                    print(f"Next status: {self.state}")
+                    return "COUNTERCLOCKWISE_ROTATION_SLOW" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION_SLOW"
+                
+                if abs(yolo_target_offset) > D_YOLO_ALIGNED:
+                    print(f"yolo_target_offset: {yolo_target_offset}")
+                    self.rotate_direction = 1 if yolo_target_offset > 0 else -1
+                    self.last_detected_offset = yolo_target_offset
                     self.state = FSMState.ALIGN_TARGET
+                    print(f"Next status: {self.state}")
+                    return "COUNTERCLOCKWISE_ROTATION_SLOW" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION_SLOW"
+
+                if (yolo_target_object_depth > 10.0 and 
+                    front_is_wide):
+                    print(f"lrange: {lidar_forward}")
+                    print(f"Next status: {self.state}")
+                    return "FORWARD_SLOW"
+                if detected_target and 0.0 < yolo_target_object_depth < 10.0:
+                    print(f"yolo_target_object_depth:{yolo_target_object_depth}")
+                    self.state = FSMState.FINISH
+                    print(f"Next status: {self.state}")
+                    return "STOP"
+                else:
+                    if self.check_vehicle_stuck_by_lidar(lidar_forward):
+                        self.state = FSMState.BACKWARD
+                        self.state_duration = BACKWARD_DURATION
+                        self.fsm_start_time = now
+                        print(f"Next status: {self.state}")
+                        return "BACKWARD"
+                    print(f"Next status: {self.state}")
+                    return "FORWARD"
+
+           # 檢查前方是否可通行
+            case FSMState.CHECK_SAFE:
+                if detected_target:
+                    self.state = FSMState.ALIGN_TARGET
+                    print(f"Next status: {self.state}")
                     return "STOP"
    
-                if all(lrange > SAFE_DIST for lrange in lidar_forward):
+                if front_is_enough_space:
+                    print(f"lidar_forward: {lidar_forward}")
                     self.state = FSMState.FORWARD
                     self.state_duration = FORWARD_DURATION
+                    self.fsm_start_time = now
+                    print(f"Next status: {self.state}")
                     return "FORWARD"
                 else:
+                    print(f"Not save")
                     self.state = FSMState.ROTATE
                     self.state_duration = ROTATION_FIXED_DURATION
-                    self.rotate_direction = random.choice([-1, 1])
+                    self.rotate_direction = 1 if prefer_left else -1
                     self.fsm_start_time = now
                     print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    print(f"Next status: {self.state}")
                     return "STOP"
             
-            # 根據給定狀態時間動作    
+            # 前進    
             case FSMState.FORWARD:
-                if detected:
+                if detected_target:
                     self.state = FSMState.ALIGN_TARGET
                     return "STOP"
-                if any(lrange < OBSTACLE_DIST for lrange in lidar_forward):
+                if too_close:
+                    print(f"lidar_forward: {lidar_forward}")
                     self.state = FSMState.STOP
                     self.state_duration = STOP_DURATION
                     self.fsm_start_time = now
-                    print("DANGER!!!!!!!!!!!!!!!")
+                    print(f"Next status: {self.state}")
                     return "STOP"
-                if dt < self.state_duration:
-                    return "FORWARD"
-                elif right_narrow == True or left_narrow == True:
+                if front_is_wide:
+                    self.backward_flag = 0
+                    print(f"lidar_forward: {lidar_forward}")
+                    if dt < self.state_duration:
+                        print(f"Next status: {self.state}")
+                        return "FORWARD"
+                if right_narrow or left_narrow:
+                    print(f"lidar_right: {lidar_right}")
+                    print(f"lidar_left: {lidar_left}")
                     self.state = FSMState.ROTATE
                     self.state_duration = random.uniform(ROTATION_MIN_DURATION, ROTATION_MAX_DURATION)
-                    self.rotate_direction = 1 if right_narrow else -1
+                    self.rotate_direction = 1 if prefer_left else -1
                     self.fsm_start_time = now
+                    print(f"Next status: {self.state}")
+                    return "STOP"
+                if right_wide or left_wide:
+                    print(f"lidar_right: {lidar_right}")
+                    print(f"lidar_left: {lidar_left}")
+                    self.state = FSMState.ROTATE
+                    self.state_duration = random.uniform(ROTATION_MIN_DURATION, ROTATION_MAX_DURATION)
+                    self.rotate_direction = 1 if prefer_left else -1
+                    self.fsm_start_time = now
+                    print(f"Next status: {self.state}")
                     return "STOP"
                 else:
                     self.state = FSMState.ROTATE
@@ -437,24 +568,26 @@ class Nav2Processing:
                     self.rotate_direction = random.choice([-1, 1])
                     self.fsm_start_time = now
                     print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    print(f"Next status: {self.state}")
                     return "STOP"
 
-            # 根據給定狀態時間動作
+            # 緊急停止
             case FSMState.STOP:
-                print(f"stop_counter: {self.stop_counter}")
-                self.stop_counter += 1
                 if dt < self.state_duration:
+                    print(f"Next status: {self.state}")
                     return "STOP"
-                elif self.stop_counter > STOP_MAX:
-                    self.stop_counter = 0
+                else:
                     self.state = FSMState.BACKWARD
                     self.state_duration = BACKWARD_DURATION
                     self.fsm_start_time = now
+                    print(f"Next status: {self.state}")
                     return "BACKWARD"
-
-            # 根據給定狀態時間動作
+                
+            # 後退
             case FSMState.BACKWARD:
                 if dt < self.state_duration:
+                    self.backward_flag = 1
+                    print(f"Next status: {self.state}")
                     return "BACKWARD"
                 elif right_narrow == True or left_narrow == True:
                     self.state = FSMState.ROTATE
@@ -462,17 +595,22 @@ class Nav2Processing:
                     self.rotate_direction = 1 if right_narrow else -1
                     self.fsm_start_time = now
                     print(f"FIXED_DURATION: {self.state_duration}")
+                    print(f"Next status: {self.state}")
                     return "STOP"
                 else:
                     self.state = FSMState.ROTATE
                     self.state_duration = ROTATION_FIXED_DURATION
-                    self.rotate_direction = random.choice([-1, 1])
+                    if self.last_detected_offset != 0:
+                        self.rotate_direction = 1 if self.last_detected_offset > 0 else -1
+                    else:
+                        self.rotate_direction =  1 if prefer_left else -1
                     self.fsm_start_time = now
                     print(f"RANDOM rotate_direction: {self.rotate_direction}")
+                    print(f"Next status: {self.state}")
                     return "STOP"
 
-                    
-
+            case FSMState.FINISH:
+                return "STOP"
         return "STOP"
 
     def stop_nav(self):
