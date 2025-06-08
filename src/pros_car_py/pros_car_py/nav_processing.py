@@ -27,7 +27,7 @@ FORWARD_DURATION = 1.0
 BACKWARD_DURATION = 0.5
 STOP_DURATION = 0.5
 STOP_MAX = 3
-D_YOLO_OFFSET = 1.0
+D_YOLO_OFFSET = 200.0 # 單位為像素
 
 class FSMState(Enum):
     IDLE = auto()
@@ -348,22 +348,56 @@ class Nav2Processing:
             # 根據給定狀態時間和旋轉角度動作
             case FSMState.ROTATE:
                 if detected:
+                    self.last_detected_offset = yolo_target_offset
                     self.state = FSMState.ALIGN_TARGET
-                    self.fsm_start_time = now
                     return "STOP"
 
                 if dt < self.state_duration:
                     return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
                 else:
                     self.state = FSMState.CHECK_SAFE
+                    return "STOP"
+
+            # 根據給定狀態時間和旋轉角度動作
+            case FSMState.ALIGN_TARGET:
+                if not detected:
+                    print(f"self.last_detected_offset: {self.last_detected_offset}")
+                    self.state = FSMState.ROTATE
+                    self.state_duration = ROTATION_FIXED_DURATION
+                    self.rotate_direction = 1 if self.last_detected_offset < 0 else -1
                     self.fsm_start_time = now
+                    print(f"rotate_direction: {self.rotate_direction}")
+                    return "STOP"
+                
+                if abs(yolo_target_offset) > D_YOLO_OFFSET:
+                    self.rotate_direction = 1 if yolo_target_offset < 0 else -1
+                    self.last_detected_offset = yolo_target_offset
+                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
+                
+                elif (yolo_target_object_depth > 10.0 and 
+                    all(lrange > SAFE_DIST for lrange in lidar_forward)):
+                    self.state = FSMState.APPROACH_TARGET
+                    return "STOP"
+
+            case FSMState.APPROACH_TARGET:
+                if any(lrange < OBSTACLE_DIST for lrange in lidar_forward):
+                    self.last_detected_offset = yolo_target_offset
+                    self.state = FSMState.STOP
+                    self.state_duration = STOP_DURATION
+                    self.fsm_start_time = now
+                    print("DANGER!!!!!!!!!!!!!!!")
+                    return "STOP" 
+                               
+                if (yolo_target_object_depth > 10.0 and 
+                    all(lrange > SAFE_DIST for lrange in lidar_forward)):
+                    return "FORWARD"
+                elif yolo_target_object_depth < 10.0:
                     return "STOP"
 
            # 根據給定狀態時間動作
             case FSMState.CHECK_SAFE:
                 if detected:
                     self.state = FSMState.ALIGN_TARGET
-                    self.fsm_start_time = now
                     return "STOP"
    
                 if all(lrange > SAFE_DIST for lrange in lidar_forward):
@@ -380,8 +414,12 @@ class Nav2Processing:
             
             # 根據給定狀態時間動作    
             case FSMState.FORWARD:
+                if detected:
+                    self.state = FSMState.ALIGN_TARGET
+                    return "STOP"
                 if any(lrange < OBSTACLE_DIST for lrange in lidar_forward):
                     self.state = FSMState.STOP
+                    self.state_duration = STOP_DURATION
                     self.fsm_start_time = now
                     print("DANGER!!!!!!!!!!!!!!!")
                     return "STOP"
@@ -433,26 +471,6 @@ class Nav2Processing:
                     print(f"RANDOM rotate_direction: {self.rotate_direction}")
                     return "STOP"
 
-            # 根據給定狀態時間和旋轉角度動作
-            case FSMState.ALIGN_TARGET:
-                if abs(yolo_target_offset) > D_YOLO_OFFSET:
-                    self.last_detected_offset = 0.0
-                    self.rotate_direction = 1 if yolo_target_offset < 0 else -1
-                    return "COUNTERCLOCKWISE_ROTATION" if self.rotate_direction == 1 else "CLOCKWISE_ROTATION"
-                else:
-                    self.state = FSMState.CHECK_SAFE
-                    self.fsm_start_time = now
-                    return "STOP"
-
-            case FSMState.APPROACH_TARGET:
-                if (yolo_target_object_depth > 10.0 and 
-                    all(lrange > OBSTACLE_DIST for lrange in lidar_forward)):
-                    return "FORWARD"
-                elif yolo_target_object_depth < 10.0:
-                    self.last_detected_offset = yolo_target_offset
-                    self.state = FSMState.CHECK_SAFE
-                    self.fsm_start_time = now
-                    return "STOP"
                     
 
         return "STOP"
